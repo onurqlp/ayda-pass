@@ -1,9 +1,9 @@
 /* =========================
    AYDA MERKEZİ ŞİFRE SİSTEMİ
-   Kaynak: aynı klasördeki passwords.json
+   Kaynak: https://onurqlp.github.io/ayda-pass/passwords.json
    ========================= */
 
-const AYDA_PASSWORD_URL = "./passwords.json";
+const AYDA_PASSWORD_URL = "https://onurqlp.github.io/ayda-pass/passwords.json";
 const AYDA_ACCESS_KEY = "ayda_access";
 const AYDA_CODE_KEY = "ayda_code";
 const AYDA_FIRST_LOGIN_PREFIX = "ayda_first_";
