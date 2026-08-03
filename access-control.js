@@ -1,103 +1,70 @@
 /* =========================
    AYDA MERKEZİ ŞİFRE SİSTEMİ
-   Google Sheets CSV destekli
-   Her şifre ayrı satır okunur
+   Kaynak: aynı klasördeki passwords.json
    ========================= */
 
-const AYDA_PASSWORD_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRpwTTeOzMw7HXuF83Iv-hlUge4sDBBAogsuJPpePayqmM4gphHeH6JEE5WhE08t62ReTomvx3fZSlG/pub?gid=883250442&single=true&output=csv";
+const AYDA_PASSWORD_URL = "./passwords.json";
+const AYDA_ACCESS_KEY = "ayda_access";
+const AYDA_CODE_KEY = "ayda_code";
+const AYDA_FIRST_LOGIN_PREFIX = "ayda_first_";
+const AYDA_DAY_MS = 24 * 60 * 60 * 1000;
 
-/* Cache engellemek için URL sonuna v ekler */
+/* Tarayıcı önbelleğini engeller */
 function aydaNoCacheUrl(url) {
   return url + (url.includes("?") ? "&" : "?") + "v=" + Date.now();
 }
 
-/* CSV parser */
-function aydaParseCSV(text) {
-  const rows = [];
-  let row = [];
-  let field = "";
-  let inQuotes = false;
+/*
+ * passwords.json içindeki grupları
+ * tek tek şifre kayıtlarına dönüştürür.
+ */
+function aydaNormalizePasswords(data) {
+  if (!Array.isArray(data)) return [];
 
-  for (let i = 0; i < text.length; i++) {
-    const char = text[i];
-    const nextChar = text[i + 1];
+  return data.flatMap(group => {
+    const codes = Array.isArray(group.codes)
+      ? group.codes
+      : group.code
+        ? [group.code]
+        : [];
 
-    if (inQuotes) {
-      if (char === '"' && nextChar === '"') {
-        field += '"';
-        i++;
-      } else if (char === '"') {
-        inQuotes = false;
-      } else {
-        field += char;
-      }
-    } else {
-      if (char === '"') {
-        inQuotes = true;
-      } else if (char === ",") {
-        row.push(field);
-        field = "";
-      } else if (char === "\n") {
-        row.push(field);
-        rows.push(row);
-        row = [];
-        field = "";
-      } else if (char !== "\r") {
-        field += char;
-      }
-    }
-  }
-
-  row.push(field);
-  rows.push(row);
-
-  return rows.filter(r => r.some(cell => String(cell).trim() !== ""));
+    return codes
+      .map(code => String(code || "").trim())
+      .filter(Boolean)
+      .map(code => ({
+        category: String(group.category || "").trim(),
+        code: code,
+        expires: group.expires
+          ? String(group.expires).trim()
+          : "",
+        durationDays: Number(group.durationDays || 0),
+        permanent: group.permanent === true,
+        active: group.active === true
+      }));
+  });
 }
 
-/* TRUE / FALSE değerini güvenli oku */
-function aydaToBoolean(value) {
-  const v = String(value || "").trim().toLowerCase();
-  return v === "true" || v === "1" || v === "evet" || v === "aktif";
-}
-
-/* CSV içeriğini şifre listesine çevir */
-function aydaCsvToPasswords(csvText) {
-  const rows = aydaParseCSV(csvText);
-
-  if (!rows.length) return [];
-
-  const headers = rows[0].map(h => String(h).trim());
-
-  return rows.slice(1).map(row => {
-    const item = {};
-
-    headers.forEach((header, index) => {
-      item[header] = row[index] ? String(row[index]).trim() : "";
-    });
-
-    return {
-      category: item.category || "",
-      code: item.code || "",
-      expires: item.expires || "",
-      durationDays: Number(item.durationDays || 0),
-      active: aydaToBoolean(item.active)
-    };
-  }).filter(item => item.code);
-}
-
-/* Google Sheets'ten şifreleri çek */
+/* passwords.json dosyasını yükler */
 async function aydaLoadPasswords() {
-  const res = await fetch(aydaNoCacheUrl(AYDA_PASSWORD_URL));
+  const response = await fetch(
+    aydaNoCacheUrl(AYDA_PASSWORD_URL),
+    {
+      cache: "no-store"
+    }
+  );
 
-  if (!res.ok) {
-    throw new Error("Şifre listesi alınamadı.");
+  if (!response.ok) {
+    throw new Error(
+      "Şifre listesi alınamadı. HTTP " + response.status
+    );
   }
 
-  const csvText = await res.text();
-  return aydaCsvToPasswords(csvText);
+  const data = await response.json();
+
+  return aydaNormalizePasswords(data);
 }
 
-/* Girilen şifreyi bul */
+/* Girilen aktif şifreyi bulur */
 function aydaFindPassword(passwords, inputCode) {
   return passwords.find(item =>
     item.active === true &&
@@ -105,112 +72,317 @@ function aydaFindPassword(passwords, inputCode) {
   );
 }
 
-/* Bu şifreye ait erişimi temizle */
+/* Genel son kullanım tarihini kontrol eder */
+function aydaIsPastGlobalExpiry(passwordItem, now) {
+  if (
+    passwordItem.permanent === true ||
+    !passwordItem.expires
+  ) {
+    return false;
+  }
+
+  const expireDate = new Date(
+    passwordItem.expires + "T23:59:59"
+  );
+
+  if (Number.isNaN(expireDate.getTime())) {
+    return true;
+  }
+
+  return now > expireDate;
+}
+
+/* İlk girişten itibaren kullanım süresini kontrol eder */
+function aydaCheckUsageDuration(
+  passwordItem,
+  inputCode,
+  now,
+  createIfMissing
+) {
+  if (
+    passwordItem.permanent === true ||
+    passwordItem.durationDays <= 0
+  ) {
+    return {
+      valid: true
+    };
+  }
+
+  const key =
+    AYDA_FIRST_LOGIN_PREFIX + inputCode;
+
+  let firstLogin =
+    localStorage.getItem(key);
+
+  if (!firstLogin && createIfMissing) {
+    firstLogin = now.toISOString();
+    localStorage.setItem(key, firstLogin);
+  }
+
+  /*
+   * Eski kayıtlı oturumda başlangıç tarihi yoksa
+   * mevcut zamanı başlangıç kabul eder.
+   */
+  if (!firstLogin) {
+    firstLogin = now.toISOString();
+    localStorage.setItem(key, firstLogin);
+  }
+
+  const firstDate =
+    new Date(firstLogin);
+
+  if (Number.isNaN(firstDate.getTime())) {
+    localStorage.removeItem(key);
+
+    return {
+      valid: false,
+      message: "Şifre başlangıç bilgisi geçersiz."
+    };
+  }
+
+  const elapsedDays =
+    (now.getTime() - firstDate.getTime()) /
+    AYDA_DAY_MS;
+
+  if (
+    elapsedDays >=
+    passwordItem.durationDays
+  ) {
+    return {
+      valid: false,
+      message: "Kullanım süresi doldu."
+    };
+  }
+
+  return {
+    valid: true
+  };
+}
+
+/* Şifrenin tüm geçerlilik kontrolleri */
+function aydaValidatePassword(
+  passwordItem,
+  inputCode,
+  createIfMissing
+) {
+  const now = new Date();
+
+  if (
+    aydaIsPastGlobalExpiry(
+      passwordItem,
+      now
+    )
+  ) {
+    return {
+      valid: false,
+      message: "Şifre süresi dolmuş."
+    };
+  }
+
+  return aydaCheckUsageDuration(
+    passwordItem,
+    inputCode,
+    now,
+    createIfMissing
+  );
+}
+
+/* Açık oturum bilgisini temizler */
 function aydaClearAccess() {
-  localStorage.removeItem("ayda_access");
-  localStorage.removeItem("ayda_code");
+  localStorage.removeItem(
+    AYDA_ACCESS_KEY
+  );
+
+  localStorage.removeItem(
+    AYDA_CODE_KEY
+  );
+}
+
+/* Korumalı içeriği gösterir */
+function aydaShowProtectedContent() {
+  const loginBox =
+    document.getElementById(
+      "aydaLoginBox"
+    );
+
+  const protectedContent =
+    document.getElementById(
+      "aydaProtectedContent"
+    );
+
+  if (loginBox) {
+    loginBox.style.display = "none";
+  }
+
+  if (protectedContent) {
+    protectedContent.style.display = "block";
+  }
 }
 
 /* GİRİŞ BUTONU */
 async function aydaCheckPassword() {
-  const input = document.getElementById("aydaPasswordInput").value.trim();
-  const message = document.getElementById("aydaLoginMessage");
+  const inputElement =
+    document.getElementById(
+      "aydaPasswordInput"
+    );
+
+  const message =
+    document.getElementById(
+      "aydaLoginMessage"
+    );
+
+  const input = inputElement
+    ? inputElement.value.trim()
+    : "";
+
+  if (!message) return;
 
   if (!input) {
-    message.innerText = "Şifre giriniz.";
+    message.innerText =
+      "Şifre giriniz.";
+
     return;
   }
 
+  message.innerText =
+    "Kontrol ediliyor...";
+
   try {
-    const data = await aydaLoadPasswords();
-    const passwordItem = aydaFindPassword(data, input);
+    const passwords =
+      await aydaLoadPasswords();
+
+    const passwordItem =
+      aydaFindPassword(
+        passwords,
+        input
+      );
 
     if (!passwordItem) {
-      message.innerText = "Hatalı şifre.";
+      message.innerText =
+        "Hatalı şifre.";
+
       return;
     }
 
-    /* Genel son tarih kontrol */
-    const today = new Date();
-    const expireDate = new Date(passwordItem.expires + "T23:59:59");
+    const validation =
+      aydaValidatePassword(
+        passwordItem,
+        input,
+        true
+      );
 
-    if (today > expireDate) {
-      message.innerText = "Şifre süresi dolmuş.";
+    if (!validation.valid) {
+      message.innerText =
+        validation.message;
+
       return;
     }
 
-    /* İlk giriş + süre kontrol */
-    const key = "ayda_first_" + input;
-    const firstLogin = localStorage.getItem(key);
+    localStorage.setItem(
+      AYDA_ACCESS_KEY,
+      "true"
+    );
 
-    if (!firstLogin) {
-      localStorage.setItem(key, new Date().toISOString());
-    } else {
-      const firstDate = new Date(firstLogin);
-      const diffDays = (today - firstDate) / (1000 * 60 * 60 * 24);
+    localStorage.setItem(
+      AYDA_CODE_KEY,
+      input
+    );
 
-      if (diffDays > Number(passwordItem.durationDays)) {
-        message.innerText = "Kullanım süresi doldu.";
-        return;
-      }
-    }
+    message.innerText = "";
 
-    /* Başarılı giriş */
-    localStorage.setItem("ayda_access", "true");
-    localStorage.setItem("ayda_code", input);
+    aydaShowProtectedContent();
 
-    document.getElementById("aydaLoginBox").style.display = "none";
-    document.getElementById("aydaProtectedContent").style.display = "block";
+  } catch (error) {
+    console.error(
+      "AYDA şifre sistemi yükleme hatası:",
+      error
+    );
 
-  } catch (e) {
-    console.error(e);
-    message.innerText = "Şifre sistemi yüklenemedi.";
+    message.innerText =
+      "Şifre sistemi yüklenemedi.";
   }
 }
 
 /* SAYFA AÇILINCA OTOMATİK GİRİŞ */
 async function aydaAutoLogin() {
-  const access = localStorage.getItem("ayda_access");
-  const code = localStorage.getItem("ayda_code");
+  const access =
+    localStorage.getItem(
+      AYDA_ACCESS_KEY
+    );
 
-  if (access !== "true" || !code) return;
+  const code =
+    localStorage.getItem(
+      AYDA_CODE_KEY
+    );
+
+  if (
+    access !== "true" ||
+    !code
+  ) {
+    return;
+  }
 
   try {
-    const data = await aydaLoadPasswords();
-    const passwordItem = aydaFindPassword(data, code);
+    const passwords =
+      await aydaLoadPasswords();
+
+    const passwordItem =
+      aydaFindPassword(
+        passwords,
+        code
+      );
 
     if (!passwordItem) {
       aydaClearAccess();
       return;
     }
 
-    const today = new Date();
-    const expireDate = new Date(passwordItem.expires + "T23:59:59");
+    const validation =
+      aydaValidatePassword(
+        passwordItem,
+        code,
+        false
+      );
 
-    if (today > expireDate) {
+    if (!validation.valid) {
       aydaClearAccess();
       return;
     }
 
-    const key = "ayda_first_" + code;
-    const firstLogin = localStorage.getItem(key);
+    aydaShowProtectedContent();
 
-    if (firstLogin) {
-      const firstDate = new Date(firstLogin);
-      const diffDays = (today - firstDate) / (1000 * 60 * 60 * 24);
-
-      if (diffDays > Number(passwordItem.durationDays)) {
-        aydaClearAccess();
-        return;
-      }
-    }
-
-    document.getElementById("aydaLoginBox").style.display = "none";
-    document.getElementById("aydaProtectedContent").style.display = "block";
-
-  } catch (e) {
-    console.log("Auto login error");
+  } catch (error) {
+    console.error(
+      "AYDA otomatik giriş hatası:",
+      error
+    );
   }
 }
 
-document.addEventListener("DOMContentLoaded", aydaAutoLogin);
+/* Enter tuşuyla giriş yapılmasını sağlar */
+document.addEventListener(
+  "keydown",
+  function (event) {
+    if (event.key !== "Enter") {
+      return;
+    }
+
+    const input =
+      document.getElementById(
+        "aydaPasswordInput"
+      );
+
+    if (
+      input &&
+      document.activeElement === input
+    ) {
+      aydaCheckPassword();
+    }
+  }
+);
+
+/* Sayfa açıldığında kayıtlı oturumu kontrol eder */
+document.addEventListener(
+  "DOMContentLoaded",
+  aydaAutoLogin
+);
